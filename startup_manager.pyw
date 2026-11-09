@@ -3,6 +3,7 @@ from ctypes import wintypes
 from datetime import datetime
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -29,12 +30,9 @@ BACKUPS_FILE = APP_DIR / "backups.json"
 DISABLED_FILES_DIR = APP_DIR / "disabled_files"
 BACKUPS_FILES_DIR = APP_DIR / "backups_files"
 
-# ---------------- Обновления: константы ----------------
-CURRENT_VERSION = "0.1.1"   # бампать при каждом релизе; совпадает с тегом без 'v'
+CURRENT_VERSION = "0.1.2"
 GITHUB_REPO = "denothegamer09-pixel/StartupManager"
 UPDATE_TIMEOUT = 10
-DETACHED_PROCESS = 0x00000008
-CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 REG_SOURCES = {
     "HKCU":   (winreg.HKEY_CURRENT_USER,
@@ -80,6 +78,22 @@ DEFAULT_SETTINGS = {
     "last_update_check": "",
 }
 
+
+def _atomic_write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def load_settings() -> dict:
     result = dict(DEFAULT_SETTINGS)
     try:
@@ -92,43 +106,25 @@ def load_settings() -> dict:
         pass
     return result
 
+
 def save_settings(s: dict) -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(
-        json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(SETTINGS_FILE, s)
+
 
 THEMES = {
     "light": {
-        "bg":            "#f0f0f0",
-        "fg":            "#1a1a1a",
-        "field_bg":      "#ffffff",
-        "field_fg":      "#1a1a1a",
-        "select_bg":     "#0078d7",
-        "select_fg":     "#ffffff",
-        "tree_bg":       "#ffffff",
-        "tree_fg":       "#1a1a1a",
-        "tree_disabled": "#909090",
-        "new_fg":        "#b34700",
-        "button_bg":     "#e6e6e6",
-        "button_active": "#d4d4d4",
-        "border":        "#b0b0b0",
-        "menu_bg":       "#f0f0f0",
+        "bg": "#f0f0f0", "fg": "#1a1a1a", "field_bg": "#ffffff",
+        "field_fg": "#1a1a1a", "select_bg": "#0078d7", "select_fg": "#ffffff",
+        "tree_bg": "#ffffff", "tree_fg": "#1a1a1a", "tree_disabled": "#909090",
+        "new_fg": "#b34700", "button_bg": "#e6e6e6",
+        "button_active": "#d4d4d4", "border": "#b0b0b0", "menu_bg": "#f0f0f0",
     },
     "dark": {
-        "bg":            "#2b2b2b",
-        "fg":            "#e6e6e6",
-        "field_bg":      "#3c3c3c",
-        "field_fg":      "#e6e6e6",
-        "select_bg":     "#0e639c",
-        "select_fg":     "#ffffff",
-        "tree_bg":       "#252525",
-        "tree_fg":       "#e6e6e6",
-        "tree_disabled": "#7a7a7a",
-        "new_fg":        "#ffb84d",
-        "button_bg":     "#3c3c3c",
-        "button_active": "#505050",
-        "border":        "#555555",
-        "menu_bg":       "#333333",
+        "bg": "#2b2b2b", "fg": "#e6e6e6", "field_bg": "#3c3c3c",
+        "field_fg": "#e6e6e6", "select_bg": "#0e639c", "select_fg": "#ffffff",
+        "tree_bg": "#252525", "tree_fg": "#e6e6e6", "tree_disabled": "#7a7a7a",
+        "new_fg": "#ffb84d", "button_bg": "#3c3c3c",
+        "button_active": "#505050", "border": "#555555", "menu_bg": "#333333",
     },
 }
 
@@ -136,81 +132,67 @@ THEMES = {
 def apply_theme(root: tk.Misc, settings: dict) -> None:
     c = THEMES[settings["theme"]]
     size = int(settings["font_size"])
-
     for fname in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
                   "TkHeadingFont", "TkTooltipFont", "TkFixedFont"):
         try:
             tkfont.nametofont(fname).configure(size=size)
         except tk.TclError:
             pass
-
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
     except tk.TclError:
         pass
-
-    style.configure(".",
-                    background=c["bg"], foreground=c["fg"],
-                    fieldbackground=c["field_bg"],
-                    bordercolor=c["border"],
+    style.configure(".", background=c["bg"], foreground=c["fg"],
+                    fieldbackground=c["field_bg"], bordercolor=c["border"],
                     lightcolor=c["bg"], darkcolor=c["bg"],
                     troughcolor=c["bg"], focuscolor=c["select_bg"])
     style.configure("TFrame", background=c["bg"])
     style.configure("TLabel", background=c["bg"], foreground=c["fg"])
     style.configure("TSeparator", background=c["border"])
-    style.configure("TButton",
-                    background=c["button_bg"], foreground=c["fg"],
+    style.configure("TButton", background=c["button_bg"], foreground=c["fg"],
                     borderwidth=1, focusthickness=0, padding=(10, 4))
     style.map("TButton",
               background=[("active", c["button_active"]),
-                          ("pressed", c["select_bg"]),
-                          ("disabled", c["bg"])],
+                          ("pressed", c["select_bg"]), ("disabled", c["bg"])],
               foreground=[("disabled", c["tree_disabled"])])
-    style.configure("TCheckbutton",
-                    background=c["bg"], foreground=c["fg"],
+    style.configure("TCheckbutton", background=c["bg"], foreground=c["fg"],
                     focusthickness=0)
-    style.map("TCheckbutton",
-              background=[("active", c["bg"])],
+    style.map("TCheckbutton", background=[("active", c["bg"])],
               foreground=[("disabled", c["tree_disabled"])])
     style.configure("TRadiobutton", background=c["bg"], foreground=c["fg"])
-    style.configure("TEntry",
-                    fieldbackground=c["field_bg"], foreground=c["field_fg"],
-                    insertcolor=c["fg"], bordercolor=c["border"])
+    style.configure("TEntry", fieldbackground=c["field_bg"],
+                    foreground=c["field_fg"], insertcolor=c["fg"],
+                    bordercolor=c["border"])
     style.map("TEntry",
               fieldbackground=[("readonly", c["field_bg"])],
               foreground=[("readonly", c["field_fg"])])
-    style.configure("TCombobox",
-                    fieldbackground=c["field_bg"], foreground=c["field_fg"],
-                    background=c["button_bg"], arrowcolor=c["fg"],
-                    bordercolor=c["border"], padding=(4, 2))
+    style.configure("TCombobox", fieldbackground=c["field_bg"],
+                    foreground=c["field_fg"], background=c["button_bg"],
+                    arrowcolor=c["fg"], bordercolor=c["border"], padding=(4, 2))
     style.map("TCombobox",
               fieldbackground=[("readonly", c["field_bg"])],
               foreground=[("readonly", c["field_fg"])],
               background=[("active", c["button_active"])])
-    style.configure("TSpinbox",
-                    fieldbackground=c["field_bg"], foreground=c["field_fg"],
-                    background=c["button_bg"], arrowcolor=c["fg"],
-                    bordercolor=c["border"])
-    style.configure("Treeview",
-                    background=c["tree_bg"], fieldbackground=c["tree_bg"],
-                    foreground=c["tree_fg"], bordercolor=c["border"],
-                    rowheight=int(size * 2.2 + 2))
+    style.configure("TSpinbox", fieldbackground=c["field_bg"],
+                    foreground=c["field_fg"], background=c["button_bg"],
+                    arrowcolor=c["fg"], bordercolor=c["border"])
+    style.configure("Treeview", background=c["tree_bg"],
+                    fieldbackground=c["tree_bg"], foreground=c["tree_fg"],
+                    bordercolor=c["border"], rowheight=int(size * 2.2 + 2))
     style.map("Treeview",
               background=[("selected", c["select_bg"])],
               foreground=[("selected", c["select_fg"])])
-    style.configure("Treeview.Heading",
-                    background=c["button_bg"], foreground=c["fg"],
-                    relief="flat", padding=(6, 4))
+    style.configure("Treeview.Heading", background=c["button_bg"],
+                    foreground=c["fg"], relief="flat", padding=(6, 4))
     style.map("Treeview.Heading",
               background=[("active", c["button_active"])])
-    style.configure("Vertical.TScrollbar",
-                    background=c["button_bg"], troughcolor=c["bg"],
-                    bordercolor=c["bg"], arrowcolor=c["fg"],
-                    lightcolor=c["button_bg"], darkcolor=c["button_bg"])
+    style.configure("Vertical.TScrollbar", background=c["button_bg"],
+                    troughcolor=c["bg"], bordercolor=c["bg"],
+                    arrowcolor=c["fg"], lightcolor=c["button_bg"],
+                    darkcolor=c["button_bg"])
     style.map("Vertical.TScrollbar",
               background=[("active", c["button_active"])])
-
     try:
         root.configure(bg=c["bg"])
     except tk.TclError:
@@ -227,11 +209,13 @@ def style_menu(menu: tk.Menu, settings: dict) -> None:
     except tk.TclError:
         pass
 
+
 def is_admin() -> bool:
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
+
 
 def hide_console() -> None:
     if os.name != "nt":
@@ -245,6 +229,7 @@ def hide_console() -> None:
     except Exception:
         pass
 
+
 def is_process_running(image_name: str) -> bool:
     try:
         out = subprocess.run(
@@ -255,6 +240,7 @@ def is_process_running(image_name: str) -> bool:
     except Exception:
         return False
 
+
 @dataclass
 class StartupEntry:
     name: str
@@ -264,8 +250,10 @@ class StartupEntry:
     path: str = ""
     stored_path: str = ""
 
+
 def entry_sig(e: StartupEntry) -> str:
     return f"{e.source}|{e.name}|{e.command}"
+
 
 def load_custom_sources() -> list:
     try:
@@ -282,11 +270,10 @@ def load_custom_sources() -> list:
         return out
     return []
 
+
 def save_custom_sources(items: list) -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    CUSTOM_SOURCES_FILE.write_text(
-        json.dumps({"sources": items}, ensure_ascii=False, indent=2),
-        encoding="utf-8")
+    _atomic_write_json(CUSTOM_SOURCES_FILE, {"sources": items})
+
 
 def find_custom_source(sid: str):
     for s in load_custom_sources():
@@ -294,12 +281,14 @@ def find_custom_source(sid: str):
             return s
     return None
 
+
 def custom_source_id_from_tag(source: str):
     if source.startswith("cf:"):
         return source[3:]
     if source.startswith("cr:"):
         return source[3:]
     return None
+
 
 def get_reg_source(source: str):
     if source in REG_SOURCES:
@@ -314,6 +303,7 @@ def get_reg_source(source: str):
             return (root, cs.get("path", ""))
     return None
 
+
 def get_folder_source(source: str):
     if source in FOLDER_SOURCES:
         return FOLDER_SOURCES[source]
@@ -326,11 +316,14 @@ def get_folder_source(source: str):
                 return Path(p)
     return None
 
+
 def is_registry_source(source: str) -> bool:
     return get_reg_source(source) is not None
 
+
 def is_folder_source(source: str) -> bool:
     return get_folder_source(source) is not None
+
 
 def get_source_label(source: str) -> str:
     if source in SOURCE_LABELS:
@@ -342,6 +335,7 @@ def get_source_label(source: str) -> str:
             return cs.get("label") or cs.get("path") or source
     return source
 
+
 def all_known_source_tags() -> set:
     tags = set(REG_SOURCES) | set(FOLDER_SOURCES)
     for s in load_custom_sources():
@@ -349,18 +343,19 @@ def all_known_source_tags() -> set:
         tags.add(prefix + s["id"])
     return tags
 
+
 def parse_registry_path(s: str):
     s = s.strip()
     up = s.upper()
     for name, short in (("HKEY_CURRENT_USER", "HKCU"),
                         ("HKEY_LOCAL_MACHINE", "HKLM"),
-                        ("HKCU", "HKCU"),
-                        ("HKLM", "HKLM")):
+                        ("HKCU", "HKCU"), ("HKLM", "HKLM")):
         if up.startswith(name):
             rest = s[len(name):].lstrip("\\/").strip()
             if rest:
                 return short, rest
     return None
+
 
 def load_disabled() -> list:
     try:
@@ -369,10 +364,10 @@ def load_disabled() -> list:
     except (OSError, ValueError):
         return []
 
+
 def save_disabled(items: list) -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(
-        json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(CONFIG_FILE, items)
+
 
 def add_disabled_item(name, command, source, path="", stored_path=""):
     items = [i for i in load_disabled()
@@ -381,10 +376,12 @@ def add_disabled_item(name, command, source, path="", stored_path=""):
                   "path": path, "stored_path": stored_path})
     save_disabled(items)
 
+
 def remove_disabled_item(source, name):
     items = [i for i in load_disabled()
              if not (i["source"] == source and i["name"] == name)]
     save_disabled(items)
+
 
 def load_backups() -> list:
     try:
@@ -393,27 +390,35 @@ def load_backups() -> list:
     except (OSError, ValueError):
         return []
 
+
 def save_backups(items: list) -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    BACKUPS_FILE.write_text(
-        json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(BACKUPS_FILE, items)
+
 
 def _backup_id(item: dict) -> str:
     return (f'{item.get("deleted_at","")}|'
             f'{item.get("source","")}|{item.get("name","")}')
 
+
 def _safe_move(src: Path, dst: Path) -> None:
-    """Перемещает файл, перезаписывая цель, если она существует."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists():
+        try:
+            os.chmod(dst, 0o666)
+        except OSError:
+            pass
         try:
             os.remove(str(dst))
         except OSError:
             pass
+    try:
+        os.chmod(src, 0o666)
+    except OSError:
+        pass
     shutil.move(str(src), str(dst))
 
+
 def backup_entry(e: StartupEntry) -> dict:
-    """Удаляет запись из автозагрузки, сохраняя данные для восстановления."""
     if is_registry_source(e.source):
         reg = get_reg_source(e.source)
         root, path = reg
@@ -422,10 +427,8 @@ def backup_entry(e: StartupEntry) -> dict:
                 winreg.DeleteValue(key, e.name)
         except FileNotFoundError:
             pass
-        info = {
-            "name": e.name, "command": e.command, "source": e.source,
-            "type": "registry", "path": "", "stored_path": "",
-        }
+        info = {"name": e.name, "command": e.command, "source": e.source,
+                "type": "registry", "path": "", "stored_path": ""}
     else:
         BACKUPS_FILES_DIR.mkdir(parents=True, exist_ok=True)
         src = Path(e.path if e.enabled else (e.stored_path or e.path))
@@ -436,39 +439,32 @@ def backup_entry(e: StartupEntry) -> dict:
             dst = BACKUPS_FILES_DIR / f"{prefix}__{n}__{src.name}"
             n += 1
         shutil.move(str(src), str(dst))
-        info = {
-            "name": e.name, "command": e.command, "source": e.source,
-            "type": "file", "path": e.path, "stored_path": str(dst),
-        }
-
+        info = {"name": e.name, "command": e.command, "source": e.source,
+                "type": "file", "path": e.path, "stored_path": str(dst)}
     info["deleted_at"] = datetime.now().isoformat(timespec="seconds")
     items = load_backups()
     items.append(info)
     save_backups(items)
-
     if not e.enabled:
         remove_disabled_item(e.source, e.name)
-
     return info
+
 
 def restore_backup(item: dict) -> None:
     if item.get("type") == "registry":
         reg = get_reg_source(item["source"])
         if reg is None:
             raise RuntimeError(
-                f'источник «{item["source"]}» больше не существует — '
-                f'добавьте его заново в «Управлении источниками»')
+                f'источник «{item["source"]}» больше не существует')
         root, path = reg
         with winreg.CreateKeyEx(root, path, 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, item["name"], 0, winreg.REG_SZ,
                               item["command"])
     else:
-        src = Path(item["stored_path"])
-        dst = Path(item["path"])
-        _safe_move(src, dst)
-
+        _safe_move(Path(item["stored_path"]), Path(item["path"]))
     my_id = _backup_id(item)
     save_backups([x for x in load_backups() if _backup_id(x) != my_id])
+
 
 def purge_backup(item: dict) -> None:
     if item.get("type") == "file" and item.get("stored_path"):
@@ -479,11 +475,13 @@ def purge_backup(item: dict) -> None:
     my_id = _backup_id(item)
     save_backups([x for x in load_backups() if _backup_id(x) != my_id])
 
+
 def purge_all_backups() -> None:
     for item in load_backups():
         purge_backup(item)
     if BACKUPS_FILES_DIR.exists():
         shutil.rmtree(BACKUPS_FILES_DIR, ignore_errors=True)
+
 
 def load_snapshot() -> tuple:
     if not SNAPSHOT_FILE.exists():
@@ -498,26 +496,21 @@ def load_snapshot() -> tuple:
     new = data.get("new", [])
     if not isinstance(known, list):
         return None, set()
-    return (set(known),
-            set(new) if isinstance(new, list) else set())
+    return (set(known), set(new) if isinstance(new, list) else set())
+
 
 def save_snapshot(known: set, new: set) -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    SNAPSHOT_FILE.write_text(
-        json.dumps({"known": sorted(known), "new": sorted(new)},
-                   ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(SNAPSHOT_FILE, {"known": sorted(known), "new": sorted(new)})
+
 
 def show_windows_toast(title: str, message: str, timeout: int = 10) -> bool:
     if os.name != "nt":
         return False
-
     def esc_xml(s):
         return (str(s).replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;"))
-
     def esc_ps(s):
         return esc_xml(s).replace("'", "''")
-
     ps = (
         '$ErrorActionPreference="Stop";try{'
         '[Windows.UI.Notifications.ToastNotificationManager,'
@@ -531,8 +524,7 @@ def show_windows_toast(title: str, message: str, timeout: int = 10) -> bool:
         '$n=New-Object Windows.UI.Notifications.ToastNotification $x;'
         '[Windows.UI.Notifications.ToastNotificationManager]::'
         'CreateToastNotifier("Startup Manager").Show($n);'
-        '}catch{exit 1}'
-    )
+        '}catch{exit 1}')
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive",
@@ -542,64 +534,48 @@ def show_windows_toast(title: str, message: str, timeout: int = 10) -> bool:
     except Exception:
         return False
 
-# ================== Обновления: логика ==================
+
+# ============== Проверка обновлений ==============
 
 def parse_version(v: str) -> tuple:
-    """'v1.2.3-alpha' -> (1, 2, 3). Нечисловые куски игнорируются."""
     if not v:
         return (0,)
     nums = re.findall(r"\d+", v)
     return tuple(int(n) for n in nums) if nums else (0,)
 
+
 def is_newer(remote: str, local: str = CURRENT_VERSION) -> bool:
     return parse_version(remote) > parse_version(local)
+
 
 def _http_get_json(url: str, timeout: int = UPDATE_TIMEOUT):
     req = urllib.request.Request(url, headers={
         "User-Agent": "StartupManagerPy-Updater",
-        "Accept": "application/vnd.github+json",
-    })
+        "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
-def fetch_latest_release(timeout: int = UPDATE_TIMEOUT):
-    """
-    Возвращает dict с информацией о последнем релизе,
-    либо None при ошибке. Учитывает pre-release'ы (используем /releases,
-    а не /releases/latest). Если релизов нет — fallback на /tags.
-    """
-    base = f"https://api.github.com/repos/{GITHUB_REPO}"
 
+def fetch_latest_release(timeout: int = UPDATE_TIMEOUT):
+    base = f"https://api.github.com/repos/{GITHUB_REPO}"
     try:
         data = _http_get_json(f"{base}/releases?per_page=20", timeout)
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+    except Exception:
         return None
-
     if isinstance(data, list) and data:
         data.sort(key=lambda x: x.get("published_at") or x.get("created_at") or "",
                   reverse=True)
         rel = data[0]
-        assets = []
-        for a in rel.get("assets") or []:
-            assets.append({
-                "name": a.get("name", ""),
-                "url": a.get("browser_download_url", ""),
-                "size": int(a.get("size") or 0),
-            })
         return {
             "tag": rel.get("tag_name", "") or "",
             "html_url": rel.get("html_url", ""),
             "notes": rel.get("body", "") or "",
-            "assets": assets,
             "prerelease": bool(rel.get("prerelease", False)),
-            "source": "release",
         }
-
     try:
         tags = _http_get_json(f"{base}/tags?per_page=20", timeout)
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+    except Exception:
         return None
-
     if isinstance(tags, list) and tags:
         tags.sort(key=lambda x: parse_version(x.get("name", "")), reverse=True)
         t = tags[0]
@@ -607,128 +583,58 @@ def fetch_latest_release(timeout: int = UPDATE_TIMEOUT):
             "tag": t.get("name", "") or "",
             "html_url": f"https://github.com/{GITHUB_REPO}/tree/{t.get('name','')}",
             "notes": "(Релиз ещё не оформлен на GitHub, доступен только тег.)",
-            "assets": [],
-            "prerelease": True,
-            "source": "tag",
-        }
-
+            "prerelease": True}
     return None
 
-def pick_asset(assets: list):
-    """
-    Выбирает подходящий ассет с учётом того, как запущено приложение:
-    frozen (.exe) → сначала .exe; из исходников → сначала .pyw/.py.
-    """
-    if getattr(sys, "frozen", False):
-        priority = (".exe", ".zip")
-    else:
-        priority = (".pyw", ".py", ".exe", ".zip")
-    for ext in priority:
-        for a in assets:
-            if a["name"].lower().endswith(ext):
-                return a
-    return None
 
-def download_file(url: str, dest: Path, on_progress=None, timeout: int = 60) -> bool:
-    try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "StartupManagerPy-Updater"})
-        with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
-            total = int(r.headers.get("Content-Length") or 0)
-            done = 0
-            while True:
-                chunk = r.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                if on_progress:
-                    try:
-                        on_progress(done, total)
-                    except Exception:
-                        pass
-        return True
-    except Exception:
-        try:
-            if dest.exists():
-                dest.unlink()
-        except OSError:
-            pass
-        return False
+# ============== Планировщик задач ==============
 
-def current_script_path():
-    """Путь к .py/.pyw, если запущено из исходников, иначе None."""
-    if getattr(sys, "frozen", False):
-        return None
-    argv0 = sys.argv[0] if sys.argv else ""
-    if argv0 and (argv0.lower().endswith(".py") or argv0.lower().endswith(".pyw")):
-        p = Path(argv0)
-        try:
-            p = p.resolve()
-        except OSError:
-            pass
-        if p.exists():
-            return p
-    return None
-
-def apply_update(new_file: Path) -> bool:
-    """
-    Отложенно подменяет текущий файл новым и перезапускает приложение.
-    Работает и для frozen .exe, и для запуска из .py/.pyw.
-    """
-    frozen = bool(getattr(sys, "frozen", False))
-    if frozen:
-        target = Path(sys.executable)
-    else:
-        target = current_script_path()
-        if target is None:
-            return False
-
-    pid = os.getpid()
-    backup = target.with_suffix(target.suffix + ".old")
-    new_file = Path(new_file)
-
-    def q(p):
-        return str(p).replace("'", "''")
-
-    launch = f"Start-Process -FilePath '{q(target)}'"
-
+def collect_scheduled_tasks() -> list:
+    if os.name != "nt":
+        return []
     ps = (
-        "$ErrorActionPreference = 'SilentlyContinue'\r\n"
-        f"$targetPid = {pid}\r\n"
-        "while (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) {\r\n"
-        "  Start-Sleep -Milliseconds 400\r\n"
-        "}\r\n"
-        "Start-Sleep -Milliseconds 700\r\n"
-        f"if (Test-Path -LiteralPath '{q(backup)}') {{\r\n"
-        f"  Remove-Item -Force -LiteralPath '{q(backup)}'\r\n"
-        "}\r\n"
-        f"Move-Item -Force -LiteralPath '{q(target)}' -Destination '{q(backup)}'\r\n"
-        f"Move-Item -Force -LiteralPath '{q(new_file)}' -Destination '{q(target)}'\r\n"
-        f"{launch}\r\n"
-        "Start-Sleep -Seconds 3\r\n"
-        f"Remove-Item -Force -LiteralPath '{q(backup)}'\r\n"
-        "Remove-Item -Force -LiteralPath $MyInvocation.MyCommand.Path\r\n"
-    )
-
-    fd, tmp = tempfile.mkstemp(suffix=".ps1")
-    os.close(fd)
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+        "$ErrorActionPreference='SilentlyContinue';"
+        "$tasks=Get-ScheduledTask|Where-Object{$_.State -ne 'Disabled'}"
+        "|ForEach-Object{"
+        " $lt=@($_.Triggers|Where-Object{"
+        "  $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' -or"
+        "  $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger'});"
+        " if($lt.Count -gt 0){"
+        "  $acts=($_.Actions|ForEach-Object{"
+        "   if($_.Execute){"
+        "    $s=$_.Execute;"
+        "    if($_.Arguments){$s=\"$s $($_.Arguments)\"};"
+        "    $s}})-join ' | ';"
+        "  $tr=(($lt|ForEach-Object{"
+        "   if($_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger')"
+        "    {'Logon'} else {'Boot'}})-join ',');"
+        "  [PSCustomObject]@{"
+        "   Name=$_.TaskName;Path=$_.TaskPath;State=[string]$_.State;"
+        "   TriggerType=$tr;Action=$acts}}}};"
+        "if($tasks){$tasks|ConvertTo-Json -Compress}else{'[]'}")
     try:
-        Path(tmp).write_text(ps, encoding="utf-8-sig")
-    except OSError:
-        return False
-
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-WindowStyle", "Hidden", "-Command", ps],
+            capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=40)
+    except Exception:
+        return []
+    if r.returncode != 0 or not r.stdout:
+        return []
     try:
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-WindowStyle", "Hidden", "-File", tmp],
-            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-            close_fds=True)
-    except OSError:
-        return False
-    return True
+        text = r.stdout.decode("utf-8", errors="replace").strip()
+        if not text:
+            return []
+        data = json.loads(text)
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    return data if isinstance(data, list) else []
 
-# ================== /Обновления ==================
+
+# ============== Win32 / трей ==============
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -739,6 +645,10 @@ _user32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
 _user32.DefWindowProcW.restype = ctypes.c_ssize_t
 _user32.CreateWindowExW.restype = ctypes.c_void_p
 _user32.LoadIconW.restype = ctypes.c_void_p
+_user32.LoadImageW.restype = ctypes.c_void_p
+_user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                               ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_uint]
 _user32.RegisterClassW.restype = ctypes.c_ushort
 _user32.RegisterWindowMessageW.argtypes = [ctypes.c_wchar_p]
 _user32.RegisterWindowMessageW.restype = ctypes.c_uint
@@ -750,86 +660,102 @@ NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 1, 2, 4, 0x10
 NIIF_INFO, NIIF_WARNING = 1, 2
 IDI_APPLICATION = 32512
+LR_LOADFROMFILE = 0x00000010
+IMAGE_ICON = 1
+
 
 class NOTIFYICONDATAW(ctypes.Structure):
     _fields_ = [
-        ("cbSize", ctypes.c_uint32),
-        ("hWnd", ctypes.c_void_p),
-        ("uID", ctypes.c_uint32),
-        ("uFlags", ctypes.c_uint32),
-        ("uCallbackMessage", ctypes.c_uint32),
-        ("hIcon", ctypes.c_void_p),
-        ("szTip", ctypes.c_wchar * 128),
-        ("dwState", ctypes.c_uint32),
-        ("dwStateMask", ctypes.c_uint32),
-        ("szInfo", ctypes.c_wchar * 256),
-        ("uVersion", ctypes.c_uint32),
-        ("szInfoTitle", ctypes.c_wchar * 64),
-        ("dwInfoFlags", ctypes.c_uint32),
-        ("guidItem", ctypes.c_byte * 16),
-        ("hBalloonIcon", ctypes.c_void_p),
-    ]
+        ("cbSize", ctypes.c_uint32), ("hWnd", ctypes.c_void_p),
+        ("uID", ctypes.c_uint32), ("uFlags", ctypes.c_uint32),
+        ("uCallbackMessage", ctypes.c_uint32), ("hIcon", ctypes.c_void_p),
+        ("szTip", ctypes.c_wchar * 128), ("dwState", ctypes.c_uint32),
+        ("dwStateMask", ctypes.c_uint32), ("szInfo", ctypes.c_wchar * 256),
+        ("uVersion", ctypes.c_uint32), ("szInfoTitle", ctypes.c_wchar * 64),
+        ("dwInfoFlags", ctypes.c_uint32), ("guidItem", ctypes.c_byte * 16),
+        ("hBalloonIcon", ctypes.c_void_p)]
+
 
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p,
                              ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p)
 
+
 class WNDCLASSW(ctypes.Structure):
     _fields_ = [
-        ("style", ctypes.c_uint),
-        ("lpfnWndProc", WNDPROC),
-        ("cbClsExtra", ctypes.c_int),
-        ("cbWndExtra", ctypes.c_int),
-        ("hInstance", ctypes.c_void_p),
-        ("hIcon", ctypes.c_void_p),
-        ("hCursor", ctypes.c_void_p),
-        ("hbrBackground", ctypes.c_void_p),
-        ("lpszMenuName", ctypes.c_wchar_p),
-        ("lpszClassName", ctypes.c_wchar_p),
-    ]
+        ("style", ctypes.c_uint), ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+        ("hInstance", ctypes.c_void_p), ("hIcon", ctypes.c_void_p),
+        ("hCursor", ctypes.c_void_p), ("hbrBackground", ctypes.c_void_p),
+        ("lpszMenuName", ctypes.c_wchar_p), ("lpszClassName", ctypes.c_wchar_p)]
+
+
+def _base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    try:
+        return Path(__file__).parent
+    except NameError:
+        return Path.cwd()
+
+
+def find_icon_file(ext: str):
+    p = _base_dir() / f"icon{ext}"
+    return p if p.exists() else None
+
 
 class TrayIcon:
-    def __init__(self, root, tooltip, on_show, on_menu, on_exit):
+    def __init__(self, root, tooltip, on_show, on_menu, on_exit,
+                 icon_path=None):
         self.root = root
         self.tooltip = tooltip
         self.on_show = on_show
         self.on_menu = on_menu
         self.on_exit = on_exit
+        self.icon_path = icon_path
         self.hwnd = None
         self._nid = None
         self._class_name = f"PyStartupMgrTray_{id(self)}"
         self._wndproc = WNDPROC(self._proc)
         self._taskbar_created = _user32.RegisterWindowMessageW("TaskbarCreated")
 
-    def install(self) -> None:
+    def _load_hicon(self):
+        if self.icon_path and Path(self.icon_path).exists():
+            try:
+                h = _user32.LoadImageW(None, str(self.icon_path),
+                                       IMAGE_ICON, 0, 0, LR_LOADFROMFILE)
+                if h:
+                    return h
+            except Exception:
+                pass
+        return _user32.LoadIconW(None, IDI_APPLICATION)
+
+    def install(self):
         hinst = _kernel32.GetModuleHandleW(None)
         wc = WNDCLASSW()
         wc.lpfnWndProc = self._wndproc
         wc.hInstance = hinst
         wc.lpszClassName = self._class_name
-        wc.hIcon = _user32.LoadIconW(None, IDI_APPLICATION)
+        wc.hIcon = self._load_hicon()
         if not _user32.RegisterClassW(ctypes.byref(wc)):
-            raise OSError("RegisterClassW: " +
-                          ctypes.FormatError(ctypes.get_last_error()))
+            raise OSError("RegisterClassW failed")
         self.hwnd = _user32.CreateWindowExW(
             0, self._class_name, self._class_name, 0,
             0, 0, 0, 0, None, None, hinst, None)
         if not self.hwnd:
-            raise OSError("CreateWindowExW: " +
-                          ctypes.FormatError(ctypes.get_last_error()))
-
+            raise OSError("CreateWindowExW failed")
         nid = NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(nid)
         nid.hWnd = self.hwnd
         nid.uID = 1
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         nid.uCallbackMessage = WM_TRAYICON
-        nid.hIcon = _user32.LoadIconW(None, IDI_APPLICATION)
+        nid.hIcon = self._load_hicon()
         nid.szTip = (self.tooltip or "")[:127]
         if not _shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
-            raise OSError("Shell_NotifyIcon NIM_ADD failed")
+            raise OSError("Shell_NotifyIcon failed")
         self._nid = nid
 
-    def remove(self) -> None:
+    def remove(self):
         if self._nid is not None:
             try:
                 _shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
@@ -843,7 +769,7 @@ class TrayIcon:
                 pass
             self.hwnd = None
 
-    def notify(self, title: str, message: str, warning: bool = False) -> bool:
+    def notify(self, title, message, warning=False):
         if self._nid is None:
             return False
         nid = self._nid
@@ -859,24 +785,19 @@ class TrayIcon:
     def _proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_TRAYICON:
             if lparam in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
-                try:
-                    self.root.after(0, self.on_show)
-                except Exception:
-                    pass
+                try: self.root.after(0, self.on_show)
+                except Exception: pass
                 return 0
             if lparam == WM_RBUTTONUP:
-                try:
-                    self.root.after(0, self.on_menu)
-                except Exception:
-                    pass
+                try: self.root.after(0, self.on_menu)
+                except Exception: pass
                 return 0
         if self._taskbar_created and msg == self._taskbar_created:
-            try:
-                _shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid))
-            except Exception:
-                pass
+            try: _shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid))
+            except Exception: pass
             return 0
         return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
 
 def read_registry_values(root, path):
     result = []
@@ -896,13 +817,12 @@ def read_registry_values(root, path):
             i += 1
     return result
 
+
 def collect_entries() -> list:
     entries = []
-
     for src, (root, path) in REG_SOURCES.items():
         for name, value in read_registry_values(root, path):
             entries.append(StartupEntry(name=name, command=value, source=src))
-
     for src, folder in FOLDER_SOURCES.items():
         try:
             if folder.is_dir():
@@ -912,7 +832,6 @@ def collect_entries() -> list:
                             name=f.stem, command=str(f), source=src, path=str(f)))
         except OSError:
             pass
-
     for cs in load_custom_sources():
         sid = cs["id"]
         if cs["type"] == "registry":
@@ -921,8 +840,7 @@ def collect_entries() -> list:
                     if cs.get("hive", "HKCU") == "HKCU"
                     else winreg.HKEY_LOCAL_MACHINE)
             for name, value in read_registry_values(root, cs.get("path", "")):
-                entries.append(StartupEntry(name=name, command=value,
-                                            source=tag))
+                entries.append(StartupEntry(name=name, command=value, source=tag))
         else:
             tag = "cf:" + sid
             folder = Path(cs.get("path", ""))
@@ -931,11 +849,9 @@ def collect_entries() -> list:
                     for f in sorted(folder.iterdir()):
                         if f.is_file():
                             entries.append(StartupEntry(
-                                name=f.stem, command=str(f),
-                                source=tag, path=str(f)))
+                                name=f.stem, command=str(f), source=tag, path=str(f)))
                 except OSError:
                     pass
-
     valid = all_known_source_tags()
     for item in load_disabled():
         if item.get("source") not in valid:
@@ -944,8 +860,8 @@ def collect_entries() -> list:
             name=item["name"], command=item["command"], source=item["source"],
             enabled=False, path=item.get("path", ""),
             stored_path=item.get("stored_path", "")))
-
     return entries
+
 
 def is_system_entry(e: StartupEntry) -> bool:
     if e.source in ("HKLM", "HKLM32", "CommonStartup"):
@@ -957,6 +873,7 @@ def is_system_entry(e: StartupEntry) -> bool:
         if r and r.lower() in lower:
             return True
     return False
+
 
 def disable_entry(e: StartupEntry):
     reg = get_reg_source(e.source)
@@ -977,6 +894,7 @@ def disable_entry(e: StartupEntry):
         shutil.move(str(src), str(dst))
         add_disabled_item(e.name, e.command, e.source, str(src), str(dst))
 
+
 def enable_entry(e: StartupEntry):
     reg = get_reg_source(e.source)
     if reg is not None:
@@ -985,10 +903,9 @@ def enable_entry(e: StartupEntry):
             winreg.SetValueEx(key, e.name, 0, winreg.REG_SZ, e.command)
         remove_disabled_item(e.source, e.name)
     else:
-        src = Path(e.stored_path)
-        dst = Path(e.path)
-        _safe_move(src, dst)
+        _safe_move(Path(e.stored_path), Path(e.path))
         remove_disabled_item(e.source, e.name)
+
 
 def delete_entry(e: StartupEntry):
     reg = get_reg_source(e.source)
@@ -997,15 +914,14 @@ def delete_entry(e: StartupEntry):
             root, path = reg
             with winreg.OpenKey(root, path, 0, winreg.KEY_SET_VALUE) as key:
                 winreg.DeleteValue(key, e.name)
-        else:
+        elif e.path and os.path.exists(e.path):
             os.remove(e.path)
     else:
         if reg is None and e.stored_path:
-            try:
-                os.remove(e.stored_path)
-            except OSError:
-                pass
+            try: os.remove(e.stored_path)
+            except OSError: pass
         remove_disabled_item(e.source, e.name)
+
 
 def entry_registry_key_path(e: StartupEntry) -> str:
     reg = get_reg_source(e.source)
@@ -1016,6 +932,7 @@ def entry_registry_key_path(e: StartupEntry) -> str:
             else "HKEY_LOCAL_MACHINE")
     return f"{hive}\\{sub}"
 
+
 def entry_file_path(e: StartupEntry) -> str:
     return e.path if e.enabled else (e.stored_path or e.path)
 
@@ -1025,12 +942,13 @@ def entry_display_path(e: StartupEntry) -> str:
         return entry_registry_key_path(e)
     return entry_file_path(e)
 
+
 def open_regedit_at(key_path: str) -> None:
     if is_process_running("regedit.exe"):
         try:
             subprocess.run(["taskkill", "/IM", "regedit.exe", "/F"],
-                           capture_output=True,
-                           creationflags=CREATE_NO_WINDOW, timeout=10)
+                           capture_output=True, creationflags=CREATE_NO_WINDOW,
+                           timeout=10)
         except Exception:
             pass
     try:
@@ -1046,6 +964,7 @@ def open_regedit_at(key_path: str) -> None:
     except OSError as ex:
         messagebox.showerror("Ошибка", f"Не удалось запустить regedit:\n{ex}")
 
+
 def open_in_explorer(path: str) -> None:
     if not path:
         return
@@ -1056,8 +975,8 @@ def open_in_explorer(path: str) -> None:
     if parent and os.path.isdir(parent):
         os.startfile(parent)
     else:
-        messagebox.showinfo("Не найдено",
-                            f"Файл или папка не найдены:\n{path}")
+        messagebox.showinfo("Не найдено", f"Файл или папка не найдены:\n{path}")
+
 
 def open_entry_location(e: StartupEntry) -> None:
     if is_registry_source(e.source):
@@ -1065,23 +984,22 @@ def open_entry_location(e: StartupEntry) -> None:
     else:
         open_in_explorer(entry_file_path(e))
 
+
 def add_registry_entry(name: str, command: str):
     root, path = REG_SOURCES["HKCU"]
     with winreg.CreateKeyEx(root, path, 0, winreg.KEY_SET_VALUE) as key:
         winreg.SetValueEx(key, name, 0, winreg.REG_SZ, command)
 
-def create_shortcut(lnk_path: str, target: str, arguments: str = ""):
-    def esc(s):
-        return str(s).replace('"', '""')
 
+def create_shortcut(lnk_path: str, target: str, arguments: str = ""):
+    def esc(s): return str(s).replace('"', '""')
     vbs = (
         'Set sh = CreateObject("WScript.Shell")\n'
         f'Set lnk = sh.CreateShortcut("{esc(lnk_path)}")\n'
         f'lnk.TargetPath = "{esc(target)}"\n'
         f'lnk.Arguments = "{esc(arguments)}"\n'
         f'lnk.WorkingDirectory = "{esc(str(Path(target).parent))}"\n'
-        'lnk.Save\n'
-    )
+        'lnk.Save\n')
     fd, tmp = tempfile.mkstemp(suffix=".vbs")
     os.close(fd)
     try:
@@ -1089,15 +1007,15 @@ def create_shortcut(lnk_path: str, target: str, arguments: str = ""):
         subprocess.run(["wscript", "//nologo", tmp], check=True, timeout=15,
                        creationflags=CREATE_NO_WINDOW)
     finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+        try: os.remove(tmp)
+        except OSError: pass
+
 
 def add_startup_shortcut(name: str, target: str, arguments: str = ""):
     folder = FOLDER_SOURCES["UserStartup"]
     folder.mkdir(parents=True, exist_ok=True)
     create_shortcut(str(folder / f"{name}.lnk"), target, arguments)
+
 
 class AddDialog(tk.Toplevel):
     def __init__(self, master, on_done):
@@ -1107,52 +1025,43 @@ class AddDialog(tk.Toplevel):
         self.transient(master)
         self.grab_set()
         self.on_done = on_done
-
         c = THEMES[master.settings["theme"]]
         self.configure(bg=c["bg"])
-
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
-
         ttk.Label(frm, text="Название:").grid(row=0, column=0, sticky="w", pady=4)
         self.name_var = tk.StringVar()
         ttk.Entry(frm, textvariable=self.name_var, width=52).grid(
             row=0, column=1, columnspan=2, sticky="we", pady=4)
-
         ttk.Label(frm, text="Программа:").grid(row=1, column=0, sticky="w", pady=4)
         self.path_var = tk.StringVar()
         ttk.Entry(frm, textvariable=self.path_var, width=42).grid(
             row=1, column=1, sticky="we", pady=4)
         ttk.Button(frm, text="Обзор…", command=self.browse).grid(
             row=1, column=2, sticky="w", padx=(6, 0), pady=4)
-
         ttk.Label(frm, text="Аргументы:").grid(row=2, column=0, sticky="w", pady=4)
         self.args_var = tk.StringVar()
         ttk.Entry(frm, textvariable=self.args_var, width=52).grid(
             row=2, column=1, columnspan=2, sticky="we", pady=4)
-
         ttk.Label(frm, text="Куда добавить:").grid(row=3, column=0, sticky="w", pady=4)
         self.place_var = tk.StringVar(value="Реестр (HKCU)")
         ttk.Combobox(
             frm, textvariable=self.place_var, state="readonly",
             values=["Реестр (HKCU)", "Папка автозагрузки (пользователь)"],
         ).grid(row=3, column=1, columnspan=2, sticky="we", pady=4)
-
         btns = ttk.Frame(frm)
         btns.grid(row=4, column=0, columnspan=3, sticky="e", pady=(14, 0))
         ttk.Button(btns, text="Добавить", command=self.submit).pack(side="right")
         ttk.Button(btns, text="Отмена", command=self.destroy).pack(
             side="right", padx=(0, 6))
         frm.columnconfigure(1, weight=1)
-
         self.bind("<Escape>", lambda _e: self.destroy())
 
     def browse(self):
         path = filedialog.askopenfilename(
             title="Выберите программу",
             filetypes=[("Программы", "*.exe *.bat *.cmd *.com"),
-                       ("Ярлыки", "*.lnk"),
-                       ("Все файлы", "*.*")])
+                       ("Ярлыки", "*.lnk"), ("Все файлы", "*.*")])
         if path:
             self.path_var.set(path)
             if not self.name_var.get().strip():
@@ -1166,24 +1075,23 @@ class AddDialog(tk.Toplevel):
             messagebox.showwarning("Внимание", "Укажите название.", parent=self)
             return
         if not path or not os.path.exists(path):
-            messagebox.showwarning(
-                "Внимание", "Укажите существующий путь к программе.",
-                parent=self)
+            messagebox.showwarning("Внимание",
+                "Укажите существующий путь к программе.", parent=self)
             return
         try:
             if self.place_var.get().startswith("Реестр"):
                 command = f'"{path}"'
-                if args:
-                    command += " " + args
+                if args: command += " " + args
                 add_registry_entry(name, command)
             else:
                 add_startup_shortcut(name, path, args)
         except Exception as ex:
-            messagebox.showerror(
-                "Ошибка", f"Не удалось добавить запись:\n{ex}", parent=self)
+            messagebox.showerror("Ошибка",
+                f"Не удалось добавить запись:\n{ex}", parent=self)
             return
         self.on_done()
         self.destroy()
+
 
 class DeleteDialog(tk.Toplevel):
     def __init__(self, master, entries: list):
@@ -1193,46 +1101,35 @@ class DeleteDialog(tk.Toplevel):
         self.transient(master)
         self.grab_set()
         self.result = None
-
         c = THEMES[master.settings["theme"]]
         self.configure(bg=c["bg"])
-
         frm = ttk.Frame(self, padding=16)
         frm.pack(fill="both", expand=True)
-
         ttk.Label(frm, text=f"Будет обработано записей: {len(entries)}",
                   font=("TkDefaultFont",
                         int(master.settings["font_size"]) + 1)
                   ).pack(anchor="w", pady=(0, 10))
-
         self.mode_var = tk.StringVar(value="backup")
-        ttk.Radiobutton(
-            frm,
+        ttk.Radiobutton(frm,
             text="Удалить с сохранением резервной копии (можно восстановить)",
             variable=self.mode_var, value="backup").pack(anchor="w", pady=2)
-        ttk.Radiobutton(
-            frm,
+        ttk.Radiobutton(frm,
             text="Удалить окончательно (без резервной копии)",
             variable=self.mode_var, value="permanent").pack(anchor="w", pady=2)
-
         any_file = any(not is_registry_source(e.source) for e in entries)
         self.delete_file_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            frm,
+        ttk.Checkbutton(frm,
             text="Также удалить файлы программ с диска (необратимо)",
             variable=self.delete_file_var,
-            state="normal" if any_file else "disabled",
-        ).pack(anchor="w", pady=(12, 0))
+            state="normal" if any_file else "disabled").pack(anchor="w", pady=(12, 0))
         ttk.Label(frm,
                   text="(относится только к файлам из папок автозагрузки)",
                   foreground=c["tree_disabled"]).pack(anchor="w")
-
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(18, 0))
         ttk.Button(btns, text="Удалить", command=self._ok).pack(side="right")
         ttk.Button(btns, text="Отмена", command=self._cancel).pack(
             side="right", padx=(0, 6))
-
         self.bind("<Escape>", lambda _e: self._cancel())
         self.update_idletasks()
         x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
@@ -1247,27 +1144,23 @@ class DeleteDialog(tk.Toplevel):
         self.result = None
         self.destroy()
 
+
 class BackupsDialog(tk.Toplevel):
     def __init__(self, master):
         super().__init__(master)
-        self.title("Резервные копии удалённых записей")
+        self.title("Резервные копии")
         self.geometry("820x460")
         self.transient(master)
         self.grab_set()
         self.master_app = master
-
         c = THEMES[master.settings["theme"]]
         self.configure(bg=c["bg"])
-
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
-
-        ttk.Label(
-            frm,
+        ttk.Label(frm,
             text="Записи, удалённые с сохранением резервной копии.\n"
-                 "Их можно восстановить в автозагрузку или удалить окончательно.",
+                 "Их можно восстановить или удалить окончательно.",
             justify="left").pack(anchor="w", pady=(0, 8))
-
         columns = ("name", "source", "deleted_at", "command")
         self.tree = ttk.Treeview(frm, columns=columns, show="headings",
                                  selectmode="extended")
@@ -1280,19 +1173,15 @@ class BackupsDialog(tk.Toplevel):
         self.tree.column("deleted_at", width=150, anchor="w")
         self.tree.column("command", width=380, anchor="w")
         self.tree.pack(fill="both", expand=True)
-
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(10, 0))
-        ttk.Button(btns, text="Восстановить",
-                   command=self._restore).pack(side="left")
+        ttk.Button(btns, text="Восстановить", command=self._restore).pack(side="left")
         ttk.Button(btns, text="Удалить окончательно",
                    command=self._purge).pack(side="left", padx=(6, 0))
         ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(btns, text="Очистить все",
                    command=self._purge_all).pack(side="left")
-        ttk.Button(btns, text="Закрыть",
-                   command=self.destroy).pack(side="right")
-
+        ttk.Button(btns, text="Закрыть", command=self.destroy).pack(side="right")
         self._reload()
         self.bind("<Escape>", lambda _e: self.destroy())
 
@@ -1301,24 +1190,21 @@ class BackupsDialog(tk.Toplevel):
         self._items = load_backups()
         for i, item in enumerate(self._items):
             self.tree.insert("", "end", iid=str(i),
-                             values=(item.get("name", ""),
-                                     get_source_label(item.get("source", "")),
-                                     item.get("deleted_at", ""),
-                                     item.get("command", "")))
+                values=(item.get("name", ""),
+                        get_source_label(item.get("source", "")),
+                        item.get("deleted_at", ""),
+                        item.get("command", "")))
 
     def _selected(self):
         return [self._items[int(i)] for i in self.tree.selection()]
 
     def _restore(self):
         sel = self._selected()
-        if not sel:
-            return
+        if not sel: return
         errors = []
         for item in sel:
-            try:
-                restore_backup(item)
-            except Exception as ex:
-                errors.append(f'{item.get("name")}: {ex}')
+            try: restore_backup(item)
+            except Exception as ex: errors.append(f'{item.get("name")}: {ex}')
         self._reload()
         self.master_app.refresh(notify=False)
         if errors:
@@ -1326,28 +1212,21 @@ class BackupsDialog(tk.Toplevel):
 
     def _purge(self):
         sel = self._selected()
-        if not sel:
-            return
-        if not messagebox.askyesno(
-                "Удаление",
-                f"Удалить {len(sel)} резервных копий "
-                f"без возможности восстановления?",
-                parent=self):
-            return
-        for item in sel:
-            purge_backup(item)
+        if not sel: return
+        if not messagebox.askyesno("Удаление",
+            f"Удалить {len(sel)} резервных копий без возможности восстановления?",
+            parent=self): return
+        for item in sel: purge_backup(item)
         self._reload()
 
     def _purge_all(self):
-        if not self._items:
-            return
-        if not messagebox.askyesno(
-                "Очистка",
-                f"Удалить все резервные копии ({len(self._items)} шт.)?",
-                parent=self):
+        if not self._items: return
+        if not messagebox.askyesno("Очистка",
+            f"Удалить все резервные копии ({len(self._items)} шт.)?", parent=self):
             return
         purge_all_backups()
         self._reload()
+
 
 class _PromptDialog(tk.Toplevel):
     def __init__(self, master, title, prompt, initial=""):
@@ -1357,12 +1236,10 @@ class _PromptDialog(tk.Toplevel):
         self.transient(master)
         self.grab_set()
         self.result = None
-
         settings = (master.master_app.settings
                     if hasattr(master, "master_app") else master.settings)
         c = THEMES[settings["theme"]]
         self.configure(bg=c["bg"])
-
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
         ttk.Label(frm, text=prompt).pack(anchor="w", pady=(0, 6))
@@ -1391,6 +1268,7 @@ class _PromptDialog(tk.Toplevel):
         self.result = None
         self.destroy()
 
+
 class RegistrySourceDialog(tk.Toplevel):
     def __init__(self, master, initial=None):
         super().__init__(master)
@@ -1399,48 +1277,37 @@ class RegistrySourceDialog(tk.Toplevel):
         self.transient(master)
         self.grab_set()
         self.result = None
-
         settings = (master.master_app.settings
                     if hasattr(master, "master_app") else master.settings)
         c = THEMES[settings["theme"]]
         self.configure(bg=c["bg"])
-
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
-
         ttk.Label(frm, text="Ветка реестра:").grid(row=0, column=0,
                                                    sticky="w", pady=4)
         init_full = ""
         if initial:
-            init_full = (f'{initial.get("hive","HKCU")}\\'
-                         f'{initial.get("path","")}')
+            init_full = f'{initial.get("hive","HKCU")}\\{initial.get("path","")}'
         self.path_var = tk.StringVar(value=init_full)
         ttk.Entry(frm, textvariable=self.path_var, width=56).grid(
             row=0, column=1, sticky="we", pady=4)
-
-        ttk.Label(
-            frm,
+        ttk.Label(frm,
             text="Форматы: HKCU\\Software\\MyApp\\Run,\n"
                  "HKEY_LOCAL_MACHINE\\Software\\Vendor\\Product\\Run\n"
                  "или просто Software\\Vendor\\Product\\Run (тогда HKCU).",
             foreground=c["tree_disabled"], justify="left"
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
-
-        ttk.Label(frm, text="Название:").grid(row=2, column=0,
-                                              sticky="w", pady=4)
+        ttk.Label(frm, text="Название:").grid(row=2, column=0, sticky="w", pady=4)
         self.label_var = tk.StringVar(
             value=(initial.get("label", "") if initial else ""))
         ttk.Entry(frm, textvariable=self.label_var, width=56).grid(
             row=2, column=1, sticky="we", pady=4)
-
         btns = ttk.Frame(frm)
         btns.grid(row=3, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(btns, text="OK", command=self._ok).pack(side="right")
         ttk.Button(btns, text="Отмена", command=self._cancel).pack(
             side="right", padx=(0, 6))
-
         frm.columnconfigure(1, weight=1)
-
         self.bind("<Return>", lambda _e: self._ok())
         self.bind("<Escape>", lambda _e: self._cancel())
         self.update_idletasks()
@@ -1451,8 +1318,7 @@ class RegistrySourceDialog(tk.Toplevel):
     def _ok(self):
         raw = self.path_var.get().strip()
         if not raw:
-            messagebox.showwarning("Внимание", "Укажите ветку реестра.",
-                                   parent=self)
+            messagebox.showwarning("Внимание", "Укажите ветку реестра.", parent=self)
             return
         parsed = parse_registry_path(raw)
         if parsed is None:
@@ -1470,6 +1336,7 @@ class RegistrySourceDialog(tk.Toplevel):
         self.result = None
         self.destroy()
 
+
 class SourceDialog(tk.Toplevel):
     def __init__(self, master, on_done):
         super().__init__(master)
@@ -1479,19 +1346,14 @@ class SourceDialog(tk.Toplevel):
         self.grab_set()
         self.master_app = master
         self.on_done = on_done
-
         c = THEMES[master.settings["theme"]]
         self.configure(bg=c["bg"])
-
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
-
-        ttk.Label(
-            frm,
+        ttk.Label(frm,
             text="Дополнительные источники: произвольные папки\n"
                  "и ветки реестра, которые нужно показывать в общем списке.",
             justify="left").pack(anchor="w", pady=(0, 10))
-
         columns = ("type", "label", "path")
         self.tree = ttk.Treeview(frm, columns=columns, show="headings",
                                  selectmode="browse", height=10)
@@ -1502,29 +1364,23 @@ class SourceDialog(tk.Toplevel):
         self.tree.column("label", width=220, anchor="w")
         self.tree.column("path", width=380, anchor="w")
         self.tree.pack(fill="both", expand=True)
-
         self.tree.bind("<Double-1>", lambda _e: self._edit_selected())
-
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(10, 0))
         ttk.Button(btns, text="Добавить папку…",
                    command=self._add_folder).pack(side="left")
         ttk.Button(btns, text="Добавить ветку реестра…",
                    command=self._add_registry).pack(side="left", padx=(6, 0))
-        ttk.Separator(btns, orient="vertical").pack(side="left", fill="y",
-                                                    padx=8)
+        ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(btns, text="Изменить…",
                    command=self._edit_selected).pack(side="left")
         ttk.Button(btns, text="Удалить",
                    command=self._remove_selected).pack(side="left", padx=(6, 0))
-
         close_bar = ttk.Frame(frm)
         close_bar.pack(fill="x", pady=(10, 0))
         ttk.Button(close_bar, text="Закрыть",
                    command=self.destroy).pack(side="right")
-
         self._reload()
-
         self.bind("<Escape>", lambda _e: self.destroy())
         self.update_idletasks()
         x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
@@ -1545,30 +1401,25 @@ class SourceDialog(tk.Toplevel):
 
     def _selected_source(self):
         sel = self.tree.selection()
-        if not sel:
-            return None
+        if not sel: return None
         return self._sources[int(sel[0])]
 
     def _add_folder(self):
         folder = filedialog.askdirectory(title="Выберите папку")
-        if not folder:
-            return
+        if not folder: return
         dlg = _PromptDialog(self, "Название источника",
                             "Как назвать эту папку?", Path(folder).name)
-        if dlg.result is None:
-            return
+        if dlg.result is None: return
         items = load_custom_sources()
         items.append({"id": uuid.uuid4().hex[:12], "type": "folder",
-                      "label": dlg.result or Path(folder).name,
-                      "path": folder})
+                      "label": dlg.result or Path(folder).name, "path": folder})
         save_custom_sources(items)
         self._reload()
         self.on_done()
 
     def _add_registry(self):
         dlg = RegistrySourceDialog(self)
-        if dlg.result is None:
-            return
+        if dlg.result is None: return
         hive, path, label = dlg.result
         items = load_custom_sources()
         items.append({"id": uuid.uuid4().hex[:12], "type": "registry",
@@ -1579,22 +1430,18 @@ class SourceDialog(tk.Toplevel):
 
     def _edit_selected(self):
         s = self._selected_source()
-        if not s:
-            return
+        if not s: return
         if s["type"] == "registry":
             dlg = RegistrySourceDialog(self, initial=s)
-            if dlg.result is None:
-                return
+            if dlg.result is None: return
             hive, path, label = dlg.result
             s["hive"] = hive
             s["path"] = path
             s["label"] = label or path
         else:
             dlg = _PromptDialog(self, "Название источника",
-                                "Как назвать эту папку?",
-                                s.get("label", ""))
-            if dlg.result is None:
-                return
+                                "Как назвать эту папку?", s.get("label", ""))
+            if dlg.result is None: return
             s["label"] = dlg.result or s.get("label", "")
         items = load_custom_sources()
         for i, x in enumerate(items):
@@ -1607,35 +1454,30 @@ class SourceDialog(tk.Toplevel):
 
     def _remove_selected(self):
         s = self._selected_source()
-        if not s:
-            return
-        if not messagebox.askyesno(
-            "Удаление источника",
+        if not s: return
+        if not messagebox.askyesno("Удаление источника",
             f'Удалить источник "{s.get("label", s.get("path"))}"?\n\n'
             "Записи из этого источника пропадут из списка. "
-            "Сами файлы/значения реестра затронуты не будут.",
-            parent=self):
+            "Сами файлы/значения реестра затронуты не будут.", parent=self):
             return
         items = [x for x in load_custom_sources() if x["id"] != s["id"]]
         save_custom_sources(items)
         self._reload()
         self.on_done()
 
+
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, master: "App"):
+    def __init__(self, master):
         super().__init__(master)
         self.title("Настройки")
         self.resizable(False, False)
         self.transient(master)
         self.grab_set()
         self.master_app = master
-
         c = THEMES[master.settings["theme"]]
         self.configure(bg=c["bg"])
-
         frm = ttk.Frame(self, padding=16)
         frm.pack(fill="both", expand=True)
-
         ttk.Label(frm, text="Тема оформления:").grid(row=0, column=0,
                                                      sticky="w", pady=6)
         self.theme_var = tk.StringVar(
@@ -1644,7 +1486,6 @@ class SettingsDialog(tk.Toplevel):
                              values=["Светлая", "Тёмная"], width=22)
         combo.grid(row=0, column=1, sticky="we", pady=6)
         combo.bind("<<ComboboxSelected>>", self._live_preview)
-
         ttk.Label(frm, text="Размер шрифта:").grid(row=1, column=0,
                                                    sticky="w", pady=6)
         self.font_var = tk.IntVar(value=int(master.settings["font_size"]))
@@ -1653,24 +1494,20 @@ class SettingsDialog(tk.Toplevel):
         sp.bind("<FocusOut>", self._live_preview)
         sp.bind("<Return>", self._live_preview)
         self.font_var.trace_add("write", lambda *_: self._live_preview())
-
         ttk.Separator(frm, orient="horizontal").grid(
             row=2, column=0, columnspan=2, sticky="we", pady=10)
-
         self.hide_system_var = tk.BooleanVar(
             value=bool(master.settings["hide_system"]))
         ttk.Checkbutton(frm, text="Скрывать системные программы",
                         variable=self.hide_system_var,
                         command=self._live_preview).grid(
             row=3, column=0, columnspan=2, sticky="w", pady=4)
-
         self.highlight_new_var = tk.BooleanVar(
             value=bool(master.settings["highlight_new"]))
         ttk.Checkbutton(frm, text="Подсвечивать новые записи в автозагрузке",
                         variable=self.highlight_new_var,
                         command=self._live_preview).grid(
             row=4, column=0, columnspan=2, sticky="w", pady=4)
-
         self.notify_new_var = tk.BooleanVar(
             value=bool(master.settings["notify_new"]))
         ttk.Checkbutton(frm,
@@ -1678,74 +1515,56 @@ class SettingsDialog(tk.Toplevel):
                         variable=self.notify_new_var,
                         command=self._live_preview).grid(
             row=5, column=0, columnspan=2, sticky="w", pady=4)
-
         self.confirm_var = tk.BooleanVar(
             value=bool(master.settings["confirm_delete"]))
         ttk.Checkbutton(frm, text="Подтверждать удаление записей",
                         variable=self.confirm_var,
                         command=self._live_preview).grid(
             row=6, column=0, columnspan=2, sticky="w", pady=4)
-
         ttk.Separator(frm, orient="horizontal").grid(
             row=7, column=0, columnspan=2, sticky="we", pady=10)
-
         self.minimize_to_tray_var = tk.BooleanVar(
             value=bool(master.settings["minimize_to_tray"]))
         ttk.Checkbutton(frm, text="Сворачивать в трей вместо закрытия",
                         variable=self.minimize_to_tray_var,
                         command=self._live_preview).grid(
             row=8, column=0, columnspan=2, sticky="w", pady=4)
-
         self.tray_on_minimize_var = tk.BooleanVar(
             value=bool(master.settings["tray_on_minimize"]))
         ttk.Checkbutton(frm, text="Сворачивать в трей при минимизации окна",
                         variable=self.tray_on_minimize_var,
                         command=self._live_preview).grid(
             row=9, column=0, columnspan=2, sticky="w", pady=4)
-
-        # -------- Обновления --------
         ttk.Separator(frm, orient="horizontal").grid(
             row=10, column=0, columnspan=2, sticky="we", pady=10)
-
         self.check_updates_var = tk.BooleanVar(
             value=bool(master.settings.get("check_updates", True)))
         ttk.Checkbutton(frm, text="Проверять обновления при запуске",
                         variable=self.check_updates_var,
                         command=self._live_preview).grid(
             row=11, column=0, columnspan=2, sticky="w", pady=4)
-
-        ttk.Button(frm, text="Проверить сейчас…",
-                   command=lambda: self.master_app.check_updates_async(silent=False)
-                   ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        # -------- /Обновления --------
-
-        ttk.Label(
-            frm,
+        ttk.Label(frm,
             text="Системными считаются записи из HKLM, общей папки\n"
                  "автозагрузки и команды из Windows / Program Files.",
             foreground=c["tree_disabled"], justify="left"
-        ).grid(row=13, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
+        ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(6, 0))
         actions = ttk.Frame(frm)
-        actions.grid(row=14, column=0, columnspan=2, sticky="we", pady=(14, 0))
+        actions.grid(row=13, column=0, columnspan=2, sticky="we", pady=(14, 0))
         ttk.Button(actions, text="Снять метки «новые»",
                    command=self._clear_new_marks).pack(side="left")
         ttk.Button(actions, text="Сбросить все данные…",
                    command=self._reset_all_data).pack(side="left", padx=(6, 0))
-
         btns = ttk.Frame(frm)
-        btns.grid(row=15, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        btns.grid(row=14, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(btns, text="Сохранить", command=self._save).pack(side="right")
         ttk.Button(btns, text="Отмена", command=self._cancel).pack(
             side="right", padx=(0, 6))
         ttk.Button(btns, text="Сбросить настройки",
                    command=self._reset_settings).pack(side="left")
-
         frm.columnconfigure(1, weight=1)
-
         self.bind("<Escape>", lambda _e: self._cancel())
         self.bind("<Return>", lambda _e: self._save())
-
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
         self.update_idletasks()
         x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
         y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 3
@@ -1801,8 +1620,7 @@ class SettingsDialog(tk.Toplevel):
         messagebox.showinfo("Готово", "Метки «новые» сняты.", parent=self)
 
     def _reset_all_data(self):
-        if not messagebox.askyesno(
-            "Подтверждение",
+        if not messagebox.askyesno("Подтверждение",
             "Будут удалены:\n"
             "• список отключённых записей,\n"
             "• все резервные копии удалённых записей,\n"
@@ -1813,11 +1631,9 @@ class SettingsDialog(tk.Toplevel):
             return
         try:
             for f in (CONFIG_FILE, SNAPSHOT_FILE, BACKUPS_FILE):
-                if f.exists():
-                    f.unlink()
+                if f.exists(): f.unlink()
             for d in (DISABLED_FILES_DIR, BACKUPS_FILES_DIR):
-                if d.exists():
-                    shutil.rmtree(d, ignore_errors=True)
+                if d.exists(): shutil.rmtree(d, ignore_errors=True)
         except OSError as ex:
             messagebox.showerror("Ошибка", str(ex), parent=self)
             return
@@ -1826,145 +1642,256 @@ class SettingsDialog(tk.Toplevel):
         self.master_app.refresh(notify=False)
         messagebox.showinfo("Готово", "Данные сброшены.", parent=self)
 
-class UpdateDialog(tk.Toplevel):
-    def __init__(self, master: "App", info: dict):
+
+class AboutDialog(tk.Toplevel):
+    def __init__(self, master):
         super().__init__(master)
-        self.title("Доступно обновление")
+        self.title("О программе")
         self.transient(master)
         self.grab_set()
-        self.geometry("640x460")
-        self.minsize(520, 340)
+        self.geometry("560x520")
+        self.minsize(480, 420)
         self.master_app = master
-        self._info = info
-        self._busy = False
 
         c = THEMES[master.settings["theme"]]
         self.configure(bg=c["bg"])
 
-        frm = ttk.Frame(self, padding=14)
+        frm = ttk.Frame(self, padding=16)
         frm.pack(fill="both", expand=True)
 
         size = int(master.settings["font_size"])
-        header = f"Доступна новая версия: {info['tag']}"
-        if info.get("prerelease"):
-            header += "  (pre-release)"
-        ttk.Label(frm, text=header,
-                  font=("TkDefaultFont", size + 2)).pack(anchor="w")
-        ttk.Label(frm, text=f"Текущая версия: {CURRENT_VERSION}").pack(
-            anchor="w", pady=(2, 10))
+        ttk.Label(frm, text=f"Менеджер автозагрузки {CURRENT_VERSION}",
+                  font=("TkDefaultFont", size + 3)).pack(anchor="w")
+        ttk.Label(frm,
+            text="• Реестр HKCU/HKLM + папки «Автозагрузка»\n"
+                 "• Пользовательские источники\n"
+                 "• Планировщик задач (Logon/Boot)\n"
+                 "• Удаление с резервной копией\n"
+                 "• Автопроверка обновлений с GitHub",
+            justify="left").pack(anchor="w", pady=(8, 12))
 
-        txt_wrap = ttk.Frame(frm)
-        txt_wrap.pack(fill="both", expand=True)
-        txt = tk.Text(txt_wrap, wrap="word", height=12, relief="flat",
-                      bg=c["field_bg"], fg=c["field_fg"],
-                      insertbackground=c["fg"], borderwidth=0)
-        sb = ttk.Scrollbar(txt_wrap, command=txt.yview)
-        txt.configure(yscrollcommand=sb.set)
-        txt.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        txt.insert("1.0", info.get("notes") or "(описание отсутствует)")
-        txt.configure(state="disabled")
+        # Блок обновлений
+        self.update_frame = ttk.LabelFrame(frm, text="Обновления", padding=10)
+        self.update_frame.pack(fill="x", pady=(0, 10))
 
-        self.progress = ttk.Progressbar(frm, mode="determinate", maximum=100)
+        self.update_status = ttk.Label(self.update_frame,
+                                       text="Нажмите «Проверить», чтобы узнать "
+                                            "о новой версии.")
+        self.update_status.pack(anchor="w", pady=(0, 6))
+
+        self.release_link = ttk.Label(self.update_frame, text="",
+                                      foreground=c["select_bg"], cursor="hand2")
+        self.release_link.pack(anchor="w", pady=(0, 6))
+        self.release_link.bind(
+            "<Button-1>", lambda _e: webbrowser.open(self._release_url or ""))
+        self._release_url = ""
+
+        ubtns = ttk.Frame(self.update_frame)
+        ubtns.pack(fill="x", pady=(4, 0))
+        self.check_btn = ttk.Button(ubtns, text="Проверить обновления",
+                                    command=self._check_updates)
+        self.check_btn.pack(side="left")
+        self.progress = ttk.Progressbar(self.update_frame, mode="indeterminate")
+
+        # Репозиторий
+        repo_url = f"https://github.com/{GITHUB_REPO}"
+        repo_frame = ttk.Frame(frm)
+        repo_frame.pack(fill="x", pady=(4, 0))
+        ttk.Label(repo_frame, text="Репозиторий: ").pack(side="left")
+        rl = ttk.Label(repo_frame, text=repo_url, foreground=c["select_bg"],
+                       cursor="hand2")
+        rl.pack(side="left")
+        rl.bind("<Button-1>", lambda _e: webbrowser.open(repo_url))
+
+        ttk.Label(frm, text=f"Файлы данных:\n{APP_DIR}",
+                  foreground=c["tree_disabled"], justify="left"
+                  ).pack(anchor="w", pady=(10, 0))
 
         btns = ttk.Frame(frm)
-        btns.pack(fill="x", pady=(12, 0))
+        btns.pack(fill="x", pady=(14, 0))
+        ttk.Button(btns, text="Закрыть", command=self.destroy).pack(side="right")
 
-        self.install_btn = ttk.Button(btns, text="Скачать и установить",
-                                      command=self._install)
-        self.install_btn.pack(side="left")
-        ttk.Button(btns, text="Открыть страницу релиза",
-                   command=lambda: webbrowser.open(info.get("html_url", ""))
-                   ).pack(side="left", padx=(6, 0))
-        ttk.Button(btns, text="Позже", command=self.destroy).pack(side="right")
-
+        self._update_queue = queue.Queue()
+        self._update_thread = None
+        self.after(100, self._poll)
         self.bind("<Escape>", lambda _e: self.destroy())
 
-    def _install(self):
-        asset = pick_asset(self._info["assets"])
-        if asset is None:
-            webbrowser.open(self._info.get("html_url", ""))
-            return
-        if self._busy:
-            return
-        if not messagebox.askyesno(
-                "Обновление",
-                f"Скачать и установить {asset['name']}?",
-                parent=self):
-            return
+        self.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
-        self._busy = True
-        self.install_btn.configure(state="disabled")
-        self.progress.pack(fill="x", pady=(8, 0))
-        self.progress.configure(value=0)
-
-        dest = (Path(tempfile.gettempdir())
-                / f"startup_mgr_upd_{uuid.uuid4().hex[:8]}__{asset['name']}")
-
-        def on_prog(done, total):
-            if total > 0:
-                pct = max(0, min(100, int(done * 100 / total)))
-                self.after(0, lambda p=pct: self.progress.configure(value=p))
+    def _check_updates(self):
+        if self._update_thread and self._update_thread.is_alive():
+            return
+        self.check_btn.configure(state="disabled")
+        self.update_status.configure(text="Проверка обновлений…")
+        self.release_link.configure(text="")
+        self._release_url = ""
+        self.progress.pack(fill="x", pady=(6, 0))
+        self.progress.start(10)
 
         def worker():
-            ok = download_file(asset["url"], dest, on_prog)
-            self.after(0, lambda: self._on_download_done(ok, dest))
+            info = fetch_latest_release()
+            self._update_queue.put(info)
+
+        self._update_thread = threading.Thread(target=worker, daemon=True)
+        self._update_thread.start()
+
+    def _poll(self):
+        try:
+            while True:
+                info = self._update_queue.get_nowait()
+                self._on_result(info)
+        except queue.Empty:
+            pass
+        try:
+            self.after(150, self._poll)
+        except tk.TclError:
+            pass
+
+    def _on_result(self, info):
+        self.check_btn.configure(state="normal")
+        try: self.progress.stop()
+        except tk.TclError: pass
+        self.progress.pack_forget()
+
+        if info is None:
+            self.update_status.configure(
+                text="Не удалось проверить обновления (нет интернета?).")
+            return
+        tag = info.get("tag", "")
+        if is_newer(tag):
+            self.update_status.configure(
+                text=f"Доступна новая версия: {tag}"
+                     + ("  (pre-release)" if info.get("prerelease") else ""))
+            self._release_url = info.get("html_url", "")
+            self.release_link.configure(
+                text="Открыть страницу релиза →")
+        else:
+            self.update_status.configure(
+                text=f"У вас последняя версия ({CURRENT_VERSION}).")
+
+
+class ScheduleDialog(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Планировщик задач — автозапуск")
+        self.geometry("900x520")
+        self.transient(master)
+        self.grab_set()
+        self.master_app = master
+
+        c = THEMES[master.settings["theme"]]
+        self.configure(bg=c["bg"])
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm,
+            text="Задачи планировщика с триггерами «при входе в систему» "
+                 "или «при запуске системы».\n"
+                 "Это ещё один канал автозапуска, который не виден в "
+                 "реестре Run и папке «Автозагрузка».",
+            justify="left").pack(anchor="w", pady=(0, 8))
+
+        columns = ("name", "path", "trigger", "state", "action")
+        self.tree = ttk.Treeview(frm, columns=columns, show="headings",
+                                 selectmode="browse")
+        self.tree.heading("name", text="Задача")
+        self.tree.heading("path", text="Папка")
+        self.tree.heading("trigger", text="Триггер")
+        self.tree.heading("state", text="Состояние")
+        self.tree.heading("action", text="Команда")
+        self.tree.column("name", width=180, anchor="w")
+        self.tree.column("path", width=150, anchor="w")
+        self.tree.column("trigger", width=90, anchor="center")
+        self.tree.column("state", width=90, anchor="center")
+        self.tree.column("action", width=440, anchor="w")
+        vsb = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(10, 0))
+        self.reload_btn = ttk.Button(btns, text="Обновить",
+                                     command=self._reload)
+        self.reload_btn.pack(side="left")
+        ttk.Button(btns, text="Открыть планировщик",
+                   command=self._open_scheduler).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Закрыть",
+                   command=self.destroy).pack(side="right")
+
+        self.status = ttk.Label(frm, text="", foreground=c["tree_disabled"])
+        self.status.pack(fill="x", pady=(6, 0))
+
+        self._reload()
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _reload(self):
+        self.reload_btn.configure(state="disabled")
+        self.status.configure(text="Чтение задач…")
+        self.update_idletasks()
+
+        def worker():
+            tasks = collect_scheduled_tasks()
+            self.after(0, lambda: self._fill(tasks))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_download_done(self, ok: bool, dest: Path):
-        if not ok:
-            self._busy = False
-            self.install_btn.configure(state="normal")
-            self.progress.pack_forget()
-            messagebox.showerror("Ошибка",
-                                 "Не удалось скачать файл обновления.",
-                                 parent=self)
-            return
+    def _fill(self, tasks):
+        self.tree.delete(*self.tree.get_children())
+        for i, t in enumerate(tasks):
+            trig = t.get("TriggerType", "")
+            trig_ru = {"Logon": "Вход", "Boot": "Загрузка"}.get(trig, trig)
+            self.tree.insert("", "end", iid=str(i),
+                values=(t.get("Name", ""), t.get("Path", ""),
+                        trig_ru, t.get("State", ""), t.get("Action", "")))
+        self.status.configure(text=f"Найдено задач: {len(tasks)}")
+        self.reload_btn.configure(state="normal")
 
-        if not getattr(sys, "frozen", False) and current_script_path() is None:
-            messagebox.showinfo("Файл скачан",
-                                f"Обновление сохранено:\n{dest}",
-                                parent=self)
-            self.destroy()
-            return
-
+    def _open_scheduler(self):
         try:
-            started = apply_update(dest)
+            subprocess.Popen(["taskschd.msc"])
         except Exception as ex:
-            started, err = False, str(ex)
-        else:
-            err = ""
-        if not started:
-            self._busy = False
-            self.install_btn.configure(state="normal")
-            messagebox.showerror(
-                "Ошибка",
-                f"Не удалось запустить установку обновления.\n{err}",
-                parent=self)
-            return
+            messagebox.showerror("Ошибка",
+                f"Не удалось открыть планировщик:\n{ex}", parent=self)
 
-        # Пора выйти — PowerShell-скрипт ждёт завершения нашего процесса
-        try:
-            self.master_app._real_exit()
-        except Exception:
-            pass
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
         self._startup_refresh = True
-        self._brand_new_entries: list = []
+        self._brand_new_entries = []
         self._known_signatures, self._new_signatures = load_snapshot()
-        self.tray: TrayIcon | None = None
+        self.tray = None
         self._update_check_in_progress = False
+        self._update_result_queue = queue.Queue()
 
         self.title("Менеджер автозагрузки")
         self.geometry(self.settings.get("window_geometry", "1000x600"))
         self.minsize(820, 520)
 
-        self.entries: list[StartupEntry] = []
+        self.entries = []
+
+        # Иконка окна
+        try:
+            ico = find_icon_file(".ico")
+            if ico:
+                self.iconbitmap(str(ico))
+            else:
+                png = find_icon_file(".png")
+                if png:
+                    self._icon_img = tk.PhotoImage(file=str(png))
+                    self.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
 
         apply_theme(self, self.settings)
         self._build_menu()
@@ -1976,19 +1903,18 @@ class App(tk.Tk):
         self.bind("<Unmap>", self._on_unmap)
 
         self.refresh(notify=True)
-
-        # Отложенная проверка обновлений — не тормозит старт
         self.after(1500, lambda: self.check_updates_async(silent=True))
+        self.after(200, self._poll_update_results)
 
     def _setup_tray(self):
         if os.name != "nt":
             return
         try:
+            ico = find_icon_file(".ico")
             self.tray = TrayIcon(
                 root=self, tooltip="Менеджер автозагрузки",
-                on_show=self._show_from_tray,
-                on_menu=self._show_tray_menu,
-                on_exit=self._real_exit)
+                on_show=self._show_from_tray, on_menu=self._show_tray_menu,
+                on_exit=self._real_exit, icon_path=ico)
             self.tray.install()
         except Exception:
             self.tray = None
@@ -2006,8 +1932,12 @@ class App(tk.Tk):
         m.add_command(label="Открыть", command=self._show_from_tray)
         m.add_command(label="Проверить автозагрузку",
                       command=lambda: self.refresh(notify=True))
-        m.add_command(label="Проверить обновления",
-                      command=lambda: self.check_updates_async(silent=False))
+        m.add_command(label="Планировщик задач…",
+                      command=lambda: (self._show_from_tray(),
+                                       self.open_scheduler()))
+        m.add_command(label="О программе…",
+                      command=lambda: (self._show_from_tray(),
+                                       self.open_about()))
         m.add_separator()
         m.add_command(label="Настройки…",
                       command=lambda: (self._show_from_tray(),
@@ -2021,16 +1951,16 @@ class App(tk.Tk):
 
     def _real_exit(self):
         if self.tray:
-            try:
-                self.tray.remove()
-            except Exception:
-                pass
+            try: self.tray.remove()
+            except Exception: pass
             self.tray = None
         try:
             self.settings["window_geometry"] = self.geometry()
             save_settings(self.settings)
         except Exception:
             pass
+        try: self._update_result_queue.put_nowait(None)
+        except Exception: pass
         self.destroy()
 
     def _on_close(self):
@@ -2040,16 +1970,13 @@ class App(tk.Tk):
         self._real_exit()
 
     def _on_unmap(self, event):
-        if event.widget is not self:
-            return
-        if not self.tray or not self.settings.get("tray_on_minimize"):
-            return
+        if event.widget is not self: return
+        if not self.tray or not self.settings.get("tray_on_minimize"): return
         self.after(1, self._maybe_hide_on_minimize)
 
     def _maybe_hide_on_minimize(self):
         try:
-            if self.state() == "iconic":
-                self.withdraw()
+            if self.state() == "iconic": self.withdraw()
         except tk.TclError:
             pass
 
@@ -2064,6 +1991,8 @@ class App(tk.Tk):
                                    command=self.open_add_dialog)
         self.file_menu.add_command(label="Управление источниками…",
                                    command=self.open_sources_dialog)
+        self.file_menu.add_command(label="Планировщик задач…",
+                                   command=self.open_scheduler)
         self.file_menu.add_command(label="Снять метки «новые»",
                                    command=self.clear_new_marks)
         self.file_menu.add_command(label="Резервные копии…",
@@ -2081,12 +2010,8 @@ class App(tk.Tk):
         self.menubar.add_cascade(label="Файл", menu=self.file_menu)
 
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
-        self.help_menu.add_command(
-            label="Проверить обновления…",
-            command=lambda: self.check_updates_async(silent=False))
-        self.help_menu.add_separator()
         self.help_menu.add_command(label="О программе…",
-                                   command=self.show_about)
+                                   command=self.open_about)
         self.menubar.add_cascade(label="Справка", menu=self.help_menu)
 
         self.config(menu=self.menubar)
@@ -2100,7 +2025,6 @@ class App(tk.Tk):
     def _build_ui(self):
         toolbar = ttk.Frame(self, padding=(8, 8, 8, 4))
         toolbar.pack(fill="x")
-
         ttk.Button(toolbar, text="Обновить",
                    command=lambda: self.refresh(notify=True)).pack(side="left")
         ttk.Separator(toolbar, orient="vertical").pack(side="left",
@@ -2115,6 +2039,8 @@ class App(tk.Tk):
                    command=self.open_add_dialog).pack(side="left", padx=2)
         ttk.Button(toolbar, text="Источники…",
                    command=self.open_sources_dialog).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Планировщик…",
+                   command=self.open_scheduler).pack(side="left", padx=2)
         ttk.Button(toolbar, text="Настройки…",
                    command=self.open_settings).pack(side="left", padx=2)
 
@@ -2126,7 +2052,6 @@ class App(tk.Tk):
 
         container = ttk.Frame(self, padding=(8, 0, 8, 8))
         container.pack(fill="both", expand=True)
-
         columns = ("check", "name", "source", "command")
         self.tree = ttk.Treeview(container, columns=columns, show="headings",
                                  selectmode="extended")
@@ -2134,22 +2059,18 @@ class App(tk.Tk):
         self.tree.heading("name", text="Название")
         self.tree.heading("source", text="Источник")
         self.tree.heading("command", text="Команда / путь")
-
         self.tree.column("check", width=40, anchor="center", stretch=False)
         self.tree.column("name", width=240, anchor="w")
         self.tree.column("source", width=220, anchor="w")
         self.tree.column("command", width=460, anchor="w")
-
         vsb = ttk.Scrollbar(container, orient="vertical",
                             command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Double-1>", self._on_tree_double)
         self.tree.bind("<Button-3>", self._on_right_click)
-
         self.bind("<F5>", lambda _e: self.refresh(notify=True))
         self.bind("<Control-c>", lambda _e: self.copy_path_selected())
         self.bind("<Delete>", lambda _e: self.delete_selected())
@@ -2172,11 +2093,10 @@ class App(tk.Tk):
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Удалить",
                                       command=self.delete_selected)
-
         self.status = ttk.Label(self, text="", padding=(10, 4), anchor="w")
         self.status.pack(fill="x")
 
-    def refresh(self, notify: bool = True):
+    def refresh(self, notify=True):
         self.entries = collect_entries()
         brand_new = self._detect_new()
         self._render()
@@ -2204,9 +2124,7 @@ class App(tk.Tk):
         c = THEMES[self.settings["theme"]]
         self.tree.tag_configure("disabled", foreground=c["tree_disabled"])
         self.tree.tag_configure("new", foreground=c["new_fg"])
-
         self.tree.delete(*self.tree.get_children())
-
         shown = hidden_sys = 0
         for idx, e in enumerate(self.entries):
             if self.settings["hide_system"] and is_system_entry(e):
@@ -2216,20 +2134,14 @@ class App(tk.Tk):
             is_new = (self.settings["highlight_new"]
                       and sig in self._new_signatures)
             tags = []
-            if not e.enabled:
-                tags.append("disabled")
-            if is_new:
-                tags.append("new")
+            if not e.enabled: tags.append("disabled")
+            if is_new: tags.append("new")
             prefix = f"{NEW_MARK} " if is_new else ""
-            self.tree.insert(
-                "", "end", iid=str(idx),
+            self.tree.insert("", "end", iid=str(idx),
                 values=(CHECK_ON if e.enabled else CHECK_OFF,
-                        prefix + e.name,
-                        get_source_label(e.source),
-                        e.command),
+                        prefix + e.name, get_source_label(e.source), e.command),
                 tags=tuple(tags))
             shown += 1
-
         parts = [f"Показано: {shown} из {len(self.entries)}"]
         if hidden_sys:
             parts.append(f"скрыто системных: {hidden_sys}")
@@ -2259,16 +2171,14 @@ class App(tk.Tk):
 
     def clear_new_marks_selected(self):
         sel = self.selected_entries()
-        if not sel:
-            return
+        if not sel: return
         for e in sel:
             self._new_signatures.discard(entry_sig(e))
         save_snapshot(self._known_signatures or set(), self._new_signatures)
         self._render()
 
-    def _notify_new(self, new_entries: list):
-        if not new_entries:
-            return
+    def _notify_new(self, new_entries):
+        if not new_entries: return
         title = "Менеджер автозагрузки"
         if len(new_entries) == 1:
             msg = f"Новая запись в автозагрузке: {new_entries[0].name}"
@@ -2279,117 +2189,97 @@ class App(tk.Tk):
             msg = f"Новых записей: {len(new_entries)} — {names}"
         sent = False
         if self.tray:
-            try:
-                sent = self.tray.notify(title, msg, warning=True)
-            except Exception:
-                sent = False
+            try: sent = self.tray.notify(title, msg, warning=True)
+            except Exception: sent = False
         if not sent:
             show_windows_toast(title, msg)
 
-    # ---------- Обновления ----------
-    def check_updates_async(self, silent: bool = True):
-        if self._update_check_in_progress:
-            return
-        if silent and not self.settings.get("check_updates", True):
-            return
+    def check_updates_async(self, silent=True):
+        if self._update_check_in_progress: return
+        if silent and not self.settings.get("check_updates", True): return
         self._update_check_in_progress = True
 
         def worker():
             info = fetch_latest_release()
-            self.after(0, lambda: self._on_update_result(info, silent))
+            self._update_result_queue.put((info, silent))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_update_result(self, info, silent: bool):
+    def _poll_update_results(self):
+        try:
+            while True:
+                item = self._update_result_queue.get_nowait()
+                if item is None: return
+                info, silent = item
+                self._on_update_result(info, silent)
+        except queue.Empty:
+            pass
+        try:
+            self.after(500, self._poll_update_results)
+        except tk.TclError:
+            pass
+
+    def _on_update_result(self, info, silent):
         self._update_check_in_progress = False
         self.settings["last_update_check"] = datetime.now().isoformat(
             timespec="seconds")
-        try:
-            save_settings(self.settings)
-        except Exception:
-            pass
-
-        if info is None:
-            if not silent:
-                messagebox.showerror(
-                    "Обновление",
-                    "Не удалось проверить обновления.\n"
-                    "Проверьте подключение к интернету.")
-            return
-
-        if not is_newer(info["tag"]):
-            if not silent:
-                messagebox.showinfo(
-                    "Обновление",
-                    f"У вас последняя версия ({CURRENT_VERSION}).")
-            return
-
-        dlg = UpdateDialog(self, info)
-        self.wait_window(dlg)
-    # ---------- /Обновления ----------
+        try: save_settings(self.settings)
+        except Exception: pass
+        if info is None: return
+        if is_newer(info["tag"]) and not silent:
+            messagebox.showinfo(
+                "Обновление",
+                f"Доступна новая версия: {info['tag']}\n\n"
+                f"Открыть страницу релиза?",
+                parent=self)
+            webbrowser.open(info.get("html_url", ""))
 
     def _on_tree_click(self, event):
-        if self.tree.identify_region(event.x, event.y) != "cell":
-            return
-        if self.tree.identify_column(event.x) != "#1":
-            return
+        if self.tree.identify_region(event.x, event.y) != "cell": return
+        if self.tree.identify_column(event.x) != "#1": return
         iid = self.tree.identify_row(event.y)
-        if not iid:
-            return
+        if not iid: return
         self._toggle_entry(int(iid))
         return "break"
 
     def _on_tree_double(self, event):
-        if self.tree.identify_region(event.x, event.y) != "cell":
-            return
-        if self.tree.identify_column(event.x) == "#1":
-            return
+        if self.tree.identify_region(event.x, event.y) != "cell": return
+        if self.tree.identify_column(event.x) == "#1": return
         iid = self.tree.identify_row(event.y)
-        if not iid:
-            return
+        if not iid: return
         self._toggle_entry(int(iid))
         return "break"
 
     def _on_right_click(self, event):
         iid = self.tree.identify_row(event.y)
-        if not iid:
-            return
+        if not iid: return
         if iid not in self.tree.selection():
             self.tree.selection_set(iid)
         sel = self.selected_entries()
         if sel and all(is_registry_source(e.source) for e in sel):
-            self.context_menu.entryconfig(
-                0, label="Открыть в редакторе реестра")
+            self.context_menu.entryconfig(0, label="Открыть в редакторе реестра")
         elif sel and all(is_folder_source(e.source) for e in sel):
-            self.context_menu.entryconfig(
-                0, label="Открыть в проводнике")
+            self.context_menu.entryconfig(0, label="Открыть в проводнике")
         else:
-            self.context_menu.entryconfig(
-                0, label="Открыть расположение")
-
+            self.context_menu.entryconfig(0, label="Открыть расположение")
         any_new = any(entry_sig(e) in self._new_signatures for e in sel)
         try:
-            self.context_menu.entryconfig(
-                6, state="normal" if any_new else "disabled")
+            self.context_menu.entryconfig(6, state="normal" if any_new else "disabled")
         except tk.TclError:
             pass
-
         style_menu(self.context_menu, self.settings)
         try:
             self.context_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.context_menu.grab_release()
 
-    def _toggle_entry(self, idx: int):
+    def _toggle_entry(self, idx):
         e = self.entries[idx]
         try:
-            if e.enabled:
-                disable_entry(e)
-            else:
-                enable_entry(e)
+            if e.enabled: disable_entry(e)
+            else: enable_entry(e)
         except PermissionError:
-            messagebox.showerror(
-                "Недостаточно прав",
+            messagebox.showerror("Недостаточно прав",
                 f"Не удалось изменить запись «{e.name}».\n\n"
                 f"Скорее всего, требуется запуск от имени администратора.")
         except FileNotFoundError:
@@ -2397,7 +2287,7 @@ class App(tk.Tk):
                                  f"Запись «{e.name}» уже отсутствует.")
         except Exception as ex:
             messagebox.showerror("Ошибка",
-                                 f"Не удалось изменить запись «{e.name}»:\n{ex}")
+                f"Не удалось изменить запись «{e.name}»:\n{ex}")
         self.refresh(notify=False)
 
     def open_location_selected(self):
@@ -2407,14 +2297,12 @@ class App(tk.Tk):
                                 "Сначала выберите запись в списке.")
             return
         for e in sel:
-            try:
-                open_entry_location(e)
+            try: open_entry_location(e)
             except Exception as ex:
-                messagebox.showerror(
-                    "Ошибка",
+                messagebox.showerror("Ошибка",
                     f"Не удалось открыть расположение для «{e.name}»:\n{ex}")
 
-    def _set_clipboard(self, text: str):
+    def _set_clipboard(self, text):
         self.clipboard_clear()
         self.clipboard_append(text)
         self.update_idletasks()
@@ -2422,18 +2310,15 @@ class App(tk.Tk):
     def copy_path_selected(self):
         sel = self.selected_entries()
         if sel:
-            self._set_clipboard(
-                "\n".join(entry_display_path(e) for e in sel))
+            self._set_clipboard("\n".join(entry_display_path(e) for e in sel))
 
     def copy_name_selected(self):
         sel = self.selected_entries()
-        if sel:
-            self._set_clipboard("\n".join(e.name for e in sel))
+        if sel: self._set_clipboard("\n".join(e.name for e in sel))
 
     def copy_command_selected(self):
         sel = self.selected_entries()
-        if sel:
-            self._set_clipboard("\n".join(e.command for e in sel))
+        if sel: self._set_clipboard("\n".join(e.command for e in sel))
 
     def delete_selected(self):
         sel = self.selected_entries()
@@ -2441,42 +2326,31 @@ class App(tk.Tk):
             messagebox.showinfo("Менеджер автозагрузки",
                                 "Сначала выберите запись в списке.")
             return
-
         dlg = DeleteDialog(self, sel)
         self.wait_window(dlg)
-        if dlg.result is None:
-            return
+        if dlg.result is None: return
         mode, also_delete_file = dlg.result
-
         if also_delete_file:
-            if not messagebox.askyesno(
-                    "Опасное действие",
-                    "Файлы выбранных программ будут удалены с диска "
-                    "без возможности восстановления.\n\nПродолжить?"):
+            if not messagebox.askyesno("Опасное действие",
+                "Файлы выбранных программ будут удалены с диска "
+                "без возможности восстановления.\n\nПродолжить?"):
                 return
-
         errors = []
         for e in sel:
             try:
                 is_reg = is_registry_source(e.source)
-
                 if also_delete_file and not is_reg:
                     p = entry_file_path(e)
                     try:
-                        if p and os.path.exists(p):
-                            os.remove(p)
+                        if p and os.path.exists(p): os.remove(p)
                     except OSError as ex:
-                        errors.append(
-                            f"{e.name}: не удалось удалить файл: {ex}")
+                        errors.append(f"{e.name}: не удалось удалить файл: {ex}")
                         continue
                     remove_disabled_item(e.source, e.name)
                     self._new_signatures.discard(entry_sig(e))
                     continue
-
-                if mode == "backup":
-                    backup_entry(e)
-                else:
-                    delete_entry(e)
+                if mode == "backup": backup_entry(e)
+                else: delete_entry(e)
                 self._new_signatures.discard(entry_sig(e))
             except PermissionError:
                 errors.append(f"{e.name}: недостаточно прав "
@@ -2485,7 +2359,6 @@ class App(tk.Tk):
                 errors.append(f"{e.name}: запись уже отсутствует")
             except Exception as ex:
                 errors.append(f"{e.name}: {ex}")
-
         save_snapshot(self._known_signatures or set(), self._new_signatures)
         self.refresh(notify=False)
         if errors:
@@ -2503,28 +2376,18 @@ class App(tk.Tk):
     def open_settings(self):
         SettingsDialog(self)
 
-    def show_about(self):
-        messagebox.showinfo(
-            "О программе",
-            f"Менеджер автозагрузки {CURRENT_VERSION}\n\n"
-            "Поддерживает:\n"
-            "• встроенные источники (Run-ключи HKCU/HKLM "
-            "и папки «Автозагрузка»)\n"
-            "• пользовательские источники "
-            "(произвольные папки и ветки реестра)\n"
-            "• удаление с резервной копией и восстановление\n"
-            "• автообновление с GitHub\n\n"
-            f"Репозиторий:\nhttps://github.com/{GITHUB_REPO}\n\n"
-            f"Файлы данных:\n{APP_DIR}")
+    def open_scheduler(self):
+        ScheduleDialog(self)
+
+    def open_about(self):
+        AboutDialog(self)
 
     def export_config(self):
         path = filedialog.asksaveasfilename(
-            title="Экспорт конфигурации",
-            defaultextension=".json",
+            title="Экспорт конфигурации", defaultextension=".json",
             filetypes=[("JSON", "*.json")],
             initialfile="startup_manager_config.json")
-        if not path:
-            return
+        if not path: return
         data = {
             "version": 3,
             "settings": self.settings,
@@ -2533,9 +2396,8 @@ class App(tk.Tk):
             "backups": load_backups(),
         }
         try:
-            Path(path).write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8")
+            Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                  encoding="utf-8")
         except OSError as ex:
             messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{ex}")
             return
@@ -2545,8 +2407,7 @@ class App(tk.Tk):
         path = filedialog.askopenfilename(
             title="Импорт конфигурации",
             filetypes=[("JSON", "*.json"), ("Все файлы", "*.*")])
-        if not path:
-            return
+        if not path: return
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
         except Exception as ex:
@@ -2558,21 +2419,17 @@ class App(tk.Tk):
         has_sources = isinstance(data.get("custom_sources"), list)
         has_backups = isinstance(data.get("backups"), list)
         msg = "Будет заменён список отключённых записей"
-        if has_sources:
-            msg += " и набор пользовательских источников"
-        if has_backups:
-            msg += " и список резервных копий"
+        if has_sources: msg += " и набор пользовательских источников"
+        if has_backups: msg += " и список резервных копий"
         msg += " (и, если есть в файле, настройки).\n\nПродолжить?"
-        if not messagebox.askyesno("Импорт", msg):
-            return
+        if not messagebox.askyesno("Импорт", msg): return
         save_disabled(data["disabled"])
         if has_sources:
             save_custom_sources([s for s in data["custom_sources"]
                                  if isinstance(s, dict) and s.get("id")
                                  and s.get("type") in ("folder", "registry")
                                  and s.get("path")])
-        if has_backups:
-            save_backups(data["backups"])
+        if has_backups: save_backups(data["backups"])
         if isinstance(data.get("settings"), dict):
             for k in DEFAULT_SETTINGS:
                 if k in data["settings"]:
@@ -2581,6 +2438,7 @@ class App(tk.Tk):
             self.apply_settings()
         self.refresh(notify=False)
         messagebox.showinfo("Готово", "Конфигурация импортирована.")
+
 
 def main():
     if os.name != "nt":
